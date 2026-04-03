@@ -17,10 +17,10 @@ import h5py
 import numpy as np
 from copy import deepcopy
 from PIL import Image, ImageOps, ImageFilter
-from torchvision import transforms
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
-from torch.optim import SGD
+import torch.nn.functional as F
+from torch.optim import SGD, AdamW, Adam
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
@@ -30,7 +30,7 @@ sys.path.append(project_root)
 from models.unet2d import UNet
 from utils.classes import CLASSES
 from utils.datasets import DATASET_CONFIGS
-from utils.util import count_params, init_log, AverageMeter, DiceLoss
+from utils.util import count_params, init_log, AverageMeter
 from utils.val import eval_2d
 
 
@@ -47,13 +47,17 @@ def get_parser(datasetname):
     parser.add_argument('--exp', type=str, required=True)
     parser.add_argument('--checkpoint_path', type=str, default='/data/lhy_data/checkpoints_wyy')
     parser.add_argument('--deterministic', type=str, default=False)
-    parser.add_argument('--conf_thresh', type=float, default=0.95)
-    parser.add_argument('--cutmix_p', type=float, default=0.5)
-    parser.add_argument('--strong_p', type=float, default=0.8)
-    parser.add_argument('--val_interval', type=int, default=1)
-    parser.add_argument('--val_start', type=float, default=0.5)
+    parser.add_argument('--eta', type=float, default=0.3)
+    parser.add_argument('--optimizer', type=str, default='SGD')
+    parser.add_argument('--conf_thresh', type=float, default=None)
+    parser.add_argument('--temperature', type=float, default=1.0)
+    parser.add_argument('--pert_dropout', type=float, default=0.5)
     parser.add_argument('--resize_ratio_min', type=float, default=0.5)
     parser.add_argument('--resize_ratio_max', type=float, default=2.0)
+    parser.add_argument('--cutmix_p', type=float, default=0.5)
+    parser.add_argument('--val_interval', type=int, default=1)
+    parser.add_argument('--val_start', type=float, default=0.5)
+    parser.add_argument('--threshold_momentum', type=float, default=0.999 / 4.0)
     return parser
 
 
@@ -153,7 +157,7 @@ def normalize_h5_image(image):
     return image
 
 
-class UniMatchACDCDataset(Dataset):
+class CrossMatchACDCDataset(Dataset):
     def __init__(self, mode, args, size=None, nsample=None):
         self.mode = mode
         self.args = args
@@ -177,7 +181,7 @@ class UniMatchACDCDataset(Dataset):
             if len(size) == 1:
                 return int(size[0])
             if int(size[-2]) != int(size[-1]):
-                raise ValueError(f'UniMatchACDCDataset expects square crop size, but got {size}')
+                raise ValueError(f'CrossMatchACDCDataset expects square crop size, but got {size}')
             return int(size[-1])
         raise ValueError('Invalid crop size')
 
@@ -258,8 +262,7 @@ class UniMatchACDCDataset(Dataset):
         if self.mode in ['train_l', 'train_u']:
             labeled_names, unlabeled_names = self._build_train_split()
             return labeled_names if self.mode == 'train_l' else unlabeled_names
-        eval_mode = 'val' if self.mode == 'val' else 'test'
-        split_items = self._read_split_items(eval_mode)
+        split_items = self._read_split_items('val')
         if split_items:
             expanded = self._expand_items_to_slices(split_items)
             if expanded:
@@ -273,87 +276,140 @@ class UniMatchACDCDataset(Dataset):
         sample_name = self.sample_names[index]
         with h5py.File(self._sample_path(sample_name), 'r') as h5f:
             image = normalize_h5_image(h5f['image'][:])
-            if self.mode == 'train_u':
-                label = np.zeros_like(image, dtype=np.uint8)
-            else:
-                label = h5f['label'][:].astype(np.uint8)
+            label = h5f['label'][:].astype(np.uint8)
 
         image_pil = Image.fromarray(np.uint8(np.clip(image * 255.0, 0, 255)))
-        mask_pil = Image.fromarray(label)
+        mask_pil = Image.fromarray(label if self.mode != 'train_u' else np.zeros_like(label, dtype=np.uint8))
 
         if self.mode == 'val':
             return to_tensor_gray(image_pil), torch.from_numpy(label).long()
 
         ratio_range = (self.args.resize_ratio_min, self.args.resize_ratio_max)
         image_pil, mask_pil = resize_with_ratio(image_pil, mask_pil, ratio_range)
-        ignore_value = 254 if self.mode == 'train_u' else 255
-        image_pil, mask_pil = crop_pair(image_pil, mask_pil, self.size, ignore_value)
+        image_pil, mask_pil = crop_pair(image_pil, mask_pil, self.size, ignore_value=0)
         image_pil, mask_pil = hflip_pair(image_pil, mask_pil, p=0.5)
 
         if self.mode == 'train_l':
             return to_tensor_gray(image_pil), torch.from_numpy(np.array(mask_pil)).long()
 
         img_w = deepcopy(image_pil)
-        img_s1 = deepcopy(image_pil)
-        img_s2 = deepcopy(image_pil)
-
-        if random.random() < self.args.strong_p:
-            img_s1 = transforms.ColorJitter(0.5, 0.5, 0.5, 0.25)(img_s1)
-        img_s1 = transforms.RandomGrayscale(p=0.2)(img_s1)
-        img_s1 = blur_image(img_s1, p=0.5)
+        img_s1 = blur_image(deepcopy(image_pil), p=0.5)
+        img_s2 = blur_image(deepcopy(image_pil), p=0.5)
         cutmix_box1 = obtain_cutmix_box(img_s1.size[0], p=self.args.cutmix_p)
-
-        if random.random() < self.args.strong_p:
-            img_s2 = transforms.ColorJitter(0.5, 0.5, 0.5, 0.25)(img_s2)
-        img_s2 = transforms.RandomGrayscale(p=0.2)(img_s2)
-        img_s2 = blur_image(img_s2, p=0.5)
         cutmix_box2 = obtain_cutmix_box(img_s2.size[0], p=self.args.cutmix_p)
-
-        ignore_mask = torch.zeros((self.size, self.size), dtype=torch.long)
-        mask_tensor = torch.from_numpy(np.array(mask_pil)).long()
-        ignore_mask[mask_tensor == 254] = 255
-
-        return to_tensor_gray(img_w), to_tensor_gray(img_s1), to_tensor_gray(img_s2), ignore_mask, cutmix_box1, cutmix_box2
+        return to_tensor_gray(img_w), to_tensor_gray(img_s1), to_tensor_gray(img_s2), cutmix_box1, cutmix_box2
 
     def __len__(self):
         return len(self.sample_names)
 
 
-class FeaturePerturbationUNet(nn.Module):
-    def __init__(self, in_chns, class_num, fp_dropout_p=0.5):
+class SoftDiceLossIgnore(nn.Module):
+    def __init__(self, n_classes):
+        super().__init__()
+        self.n_classes = n_classes
+
+    def forward(self, inputs, target, ignore=None):
+        if target.ndim == 3:
+            target = target.unsqueeze(1)
+        target = target.long()
+        probs = inputs if inputs.dtype.is_floating_point else torch.softmax(inputs, dim=1)
+        target_clean = target.clone()
+        target_clean[target_clean < 0] = 0
+        target_clean[target_clean >= self.n_classes] = 0
+        target_onehot = F.one_hot(target_clean.squeeze(1), num_classes=self.n_classes).permute(0, 3, 1, 2).float()
+        if ignore is None:
+            valid_mask = torch.ones_like(target_onehot)
+        else:
+            if ignore.ndim == 3:
+                ignore = ignore.unsqueeze(1)
+            valid_mask = (1.0 - ignore.float()).expand_as(target_onehot)
+        probs = probs * valid_mask
+        target_onehot = target_onehot * valid_mask
+        dims = (0, 2, 3)
+        intersection = (probs * target_onehot).sum(dim=dims)
+        denominator = probs.sum(dim=dims) + target_onehot.sum(dim=dims)
+        dice = (2.0 * intersection + 1e-10) / (denominator + 1e-10)
+        return 1.0 - dice.mean()
+
+
+class PertDropout(nn.Module):
+    def __init__(self, p=0.5):
+        super().__init__()
+        self.dropouts = nn.ModuleList([
+            nn.Dropout2d(p * 0.5),
+            nn.Dropout2d(p * 1.5),
+        ])
+
+    def __len__(self):
+        return len(self.dropouts)
+
+    def forward(self, features):
+        results = []
+        for dropout in self.dropouts:
+            results.append([dropout(feat) for feat in features])
+        return results
+
+
+class CrossMatchUNet(nn.Module):
+    def __init__(self, in_chns, class_num, pert_dropout=0.5):
         super().__init__()
         self.net = init_2d_weight(UNet(in_chns=in_chns, class_num=class_num))
-        self.fp_dropout_p = fp_dropout_p
+        self.pert = PertDropout(pert_dropout)
 
-    def forward(self, x, return_fp=False):
+    def forward(self, x, need_fp=False):
         features = self.net.encoder(x)
-        logits = self.net.decoder(features)
-        if not return_fp:
-            return logits
-        fp_features = [
-            torch.nn.functional.dropout2d(feature, p=self.fp_dropout_p, training=True)
-            for feature in features
-        ]
-        merged_features = [
-            torch.cat((feature, fp_feature), dim=0)
-            for feature, fp_feature in zip(features, fp_features)
-        ]
-        outputs = self.net.decoder(merged_features)
-        out, out_fp = outputs.chunk(2)
-        return out, out_fp
+        if need_fp:
+            if x.shape[0] % 2 != 0:
+                raise ValueError('need_fp=True expects an even batch size to split source and target halves')
+            features_x = []
+            features_u = []
+            for feat in features:
+                fx, fu = feat.chunk(2)
+                features_x.append(fx)
+                features_u.append(fu)
+            perturbed_u = self.pert(features_u)
+            decoder_inputs = [torch.cat(feature_group, dim=0) for feature_group in zip(features_x, features_u, *perturbed_u)]
+            outputs = self.net.decoder(decoder_inputs)
+            return outputs.chunk(2 + len(self.pert))
+        return self.net.decoder(features)
+
+
+class LocalThreshController:
+    def __init__(self, nclass, momentum, thresh_init=0.85):
+        self.nclass = nclass
+        self.momentum = momentum
+        self.thresh_global = thresh_init
+
+    def thresh_update(self, pred):
+        mask_pred = torch.argmax(pred, dim=1)
+        pred_softmax = pred.softmax(dim=1)
+        pred_conf = pred_softmax.max(dim=1)[0]
+        cls_num = self.nclass
+        new_global = 0.0
+        for cls in range(self.nclass):
+            cls_map = mask_pred == cls
+            if cls_map.sum() == 0:
+                cls_num -= 1
+                continue
+            new_global += pred_conf[cls_map].max().item()
+        if cls_num > 0:
+            new_global = new_global / cls_num
+            self.thresh_global = self.momentum * self.thresh_global + (1.0 - self.momentum) * new_global
+
+    def get_thresh_global(self):
+        return self.thresh_global
 
 
 def build_dataloaders(args, cfg):
-    trainset_u = UniMatchACDCDataset('train_u', args, cfg['crop_size'])
-    trainset_l = UniMatchACDCDataset('train_l', args, cfg['crop_size'], nsample=len(trainset_u))
-    valset = UniMatchACDCDataset('val', args, cfg['crop_size'])
-
+    trainset_u = CrossMatchACDCDataset('train_u', args, cfg['crop_size'])
+    trainset_l = CrossMatchACDCDataset('train_l', args, cfg['crop_size'], nsample=len(trainset_u))
+    valset = CrossMatchACDCDataset('val', args, cfg['crop_size'])
     trainloader_l = DataLoader(
         trainset_l,
         batch_size=cfg['batch_size'],
         shuffle=True,
         pin_memory=True,
-        num_workers=cfg.get('num_workers', 4),
+        num_workers=max(cfg['batch_size'] * 2, 1),
         drop_last=True,
     )
     trainloader_u = DataLoader(
@@ -361,11 +417,30 @@ def build_dataloaders(args, cfg):
         batch_size=cfg['batch_size'],
         shuffle=True,
         pin_memory=True,
-        num_workers=cfg.get('num_workers', 4),
+        num_workers=max(cfg['batch_size'] * 2, 1),
+        drop_last=True,
+    )
+    trainloader_u_mix = DataLoader(
+        trainset_u,
+        batch_size=cfg['batch_size'],
+        shuffle=True,
+        pin_memory=True,
+        num_workers=max(cfg['batch_size'] * 2, 1),
         drop_last=True,
     )
     valloader = DataLoader(valset, batch_size=1, pin_memory=True, num_workers=1, drop_last=False)
-    return trainloader_l, trainloader_u, valloader
+    return trainloader_l, trainloader_u, trainloader_u_mix, valloader
+
+
+def build_optimizer(model, args, cfg):
+    optimizer_name = args.optimizer.lower()
+    if optimizer_name == 'sgd':
+        return SGD(model.parameters(), lr=cfg['lr'], momentum=0.9, weight_decay=0.0001, nesterov=True)
+    if optimizer_name == 'adam':
+        return Adam(model.parameters(), lr=cfg['lr'], weight_decay=0.0001)
+    if optimizer_name == 'adamw':
+        return AdamW(model.parameters(), lr=cfg['lr'], weight_decay=0.0001)
+    raise NotImplementedError(args.optimizer)
 
 
 def main(args, cfg, save_path, cp_path):
@@ -375,22 +450,25 @@ def main(args, cfg, save_path, cp_path):
     logger.info('{}\n'.format(pprint.pformat(all_args)))
     writer = SummaryWriter(save_path)
 
-    model = FeaturePerturbationUNet(
-        in_chns=1,
-        class_num=cfg['nclass'],
-    ).cuda()
-    optimizer = SGD(model.parameters(), lr=cfg['lr'], momentum=0.9, weight_decay=1e-4)
-    criterion_l = nn.CrossEntropyLoss(ignore_index=255).cuda()
-    diceloss = DiceLoss(cfg['nclass']).cuda()
-    criterion_u = nn.CrossEntropyLoss(reduction='none').cuda()
+    model = CrossMatchUNet(in_chns=1, class_num=cfg['nclass'], pert_dropout=args.pert_dropout).cuda()
+    optimizer = build_optimizer(model, args, cfg)
+    criterion_ce = nn.CrossEntropyLoss(ignore_index=255).cuda()
+    criterion_dice = SoftDiceLossIgnore(cfg['nclass']).cuda()
 
     logger.info('use {} gpus!'.format(torch.cuda.device_count()))
     logger.info('Total params: {:.3f}M'.format(count_params(model)))
 
-    trainloader_l, trainloader_u, valloader = build_dataloaders(args, cfg)
+    trainloader_l, trainloader_u, trainloader_u_mix, valloader = build_dataloaders(args, cfg)
     total_iters = len(trainloader_u) * cfg['epochs']
     logger.info('Total iters: %d' % total_iters)
     class_names = build_class_names(cfg, args)
+
+    conf_thresh = cfg.get('conf_thresh', args.conf_thresh if args.conf_thresh is not None else 0.95)
+    thresh_controller = LocalThreshController(
+        nclass=cfg['nclass'],
+        momentum=args.threshold_momentum,
+        thresh_init=conf_thresh,
+    )
 
     previous_best = 0.0
     best_epoch = 0
@@ -408,43 +486,46 @@ def main(args, cfg, save_path, cp_path):
         best_epoch = checkpoint.get('best_epoch', 0)
         iter_num = checkpoint.get('iter_num', 0)
         start_time = checkpoint.get('start_time', start_time)
+        conf_thresh = checkpoint.get('conf_thresh', conf_thresh)
+        thresh_controller.thresh_global = conf_thresh
         logger.info('************ Load from checkpoint at epoch %i\n' % epoch)
 
     log_interval = max(len(trainloader_u) // 8, 1)
     for epoch in range(epoch + 1, cfg['epochs']):
         logger.info(
-            f'===> Epoch: {epoch}/{cfg["epochs"]}, seed:{args.seed}, labelnum:{args.labelnum}, '
-            f'Previous best mdice: {previous_best:.4f} @epoch:{best_epoch}'
+            '===========> Epoch: {:}, LR: {:.5f}, Previous best: {:.2f}, TH: {:.4f}'.format(
+                epoch, optimizer.param_groups[0]['lr'], previous_best, conf_thresh
+            )
         )
+
         total_loss = AverageMeter()
         total_loss_x = AverageMeter()
         total_loss_s = AverageMeter()
-        total_loss_w_fp = AverageMeter()
+        total_loss_kd = AverageMeter()
         total_mask_ratio = AverageMeter()
+        loader = zip(trainloader_l, trainloader_u, trainloader_u_mix)
 
-        loader = zip(trainloader_l, trainloader_u, trainloader_u)
-        for i, ((img_x, mask_x),
-                (img_u_w, img_u_s1, img_u_s2, ignore_mask, cutmix_box1, cutmix_box2),
-                (img_u_w_mix, img_u_s1_mix, img_u_s2_mix, ignore_mask_mix, _, _)) in enumerate(loader):
-
+        for i, ((img_x, mask_x), (img_u_w, img_u_s1, img_u_s2, cutmix_box1, cutmix_box2), (img_u_w_mix, img_u_s1_mix, img_u_s2_mix, _, _)) in enumerate(loader):
             img_x = img_x.cuda(non_blocking=True)
             mask_x = mask_x.cuda(non_blocking=True)
             img_u_w = img_u_w.cuda(non_blocking=True)
             img_u_s1 = img_u_s1.cuda(non_blocking=True)
             img_u_s2 = img_u_s2.cuda(non_blocking=True)
-            ignore_mask = ignore_mask.cuda(non_blocking=True)
             cutmix_box1 = cutmix_box1.cuda(non_blocking=True)
             cutmix_box2 = cutmix_box2.cuda(non_blocking=True)
             img_u_w_mix = img_u_w_mix.cuda(non_blocking=True)
             img_u_s1_mix = img_u_s1_mix.cuda(non_blocking=True)
             img_u_s2_mix = img_u_s2_mix.cuda(non_blocking=True)
-            ignore_mask_mix = ignore_mask_mix.cuda(non_blocking=True)
 
             with torch.no_grad():
-                model.eval()
                 pred_u_w_mix = model(img_u_w_mix).detach()
                 conf_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)[0]
                 mask_u_w_mix = pred_u_w_mix.argmax(dim=1)
+                _, _, pred_u_w_weak_mix, pred_u_w_strong_mix = model(torch.cat((img_x, img_u_w_mix)), need_fp=True)
+                conf_u_w_weak_mix = pred_u_w_weak_mix.softmax(dim=1).max(dim=1)[0]
+                mask_u_w_weak_mix = pred_u_w_weak_mix.argmax(dim=1)
+                conf_u_w_strong_mix = pred_u_w_strong_mix.softmax(dim=1).max(dim=1)[0]
+                mask_u_w_strong_mix = pred_u_w_strong_mix.argmax(dim=1)
 
             cutmix_box1_mask = cutmix_box1.unsqueeze(1).expand_as(img_u_s1) == 1
             cutmix_box2_mask = cutmix_box2.unsqueeze(1).expand_as(img_u_s2) == 1
@@ -452,57 +533,86 @@ def main(args, cfg, save_path, cp_path):
             img_u_s2[cutmix_box2_mask] = img_u_s2_mix[cutmix_box2_mask]
 
             model.train()
-            num_lb, num_ulb = img_x.shape[0], img_u_w.shape[0]
 
-            preds, preds_fp = model(torch.cat((img_x, img_u_w)), return_fp=True)
-            pred_x, pred_u_w = preds.split([num_lb, num_ulb])
-            pred_u_w_fp = preds_fp[num_lb:]
-            pred_u_s1, pred_u_s2 = model(torch.cat((img_u_s1, img_u_s2))).chunk(2)
+            pred_x, pred_u_w, pred_u_w_weak, pred_u_w_strong = model(torch.cat((img_x, img_u_w)), need_fp=True)
+            pred_u_s1, pred_u_s2, pred_u_s2_weak, pred_u_s2_strong = model(torch.cat((img_u_s1, img_u_s2)), need_fp=True)
+
+            if args.temperature != 1:
+                pred_u_w = pred_u_w / args.temperature
+                pred_u_w_weak = pred_u_w_weak / args.temperature
+                pred_u_w_strong = pred_u_w_strong / args.temperature
 
             pred_u_w = pred_u_w.detach()
             conf_u_w = pred_u_w.softmax(dim=1).max(dim=1)[0]
             mask_u_w = pred_u_w.argmax(dim=1)
+            conf_u_w_weak = pred_u_w_weak.softmax(dim=1).max(dim=1)[0]
+            mask_u_w_weak = pred_u_w_weak.argmax(dim=1)
+            conf_u_w_strong = pred_u_w_strong.softmax(dim=1).max(dim=1)[0]
+            mask_u_w_strong = pred_u_w_strong.argmax(dim=1)
 
             mask_u_w_cutmixed1 = mask_u_w.clone()
             conf_u_w_cutmixed1 = conf_u_w.clone()
-            ignore_mask_cutmixed1 = ignore_mask.clone()
-
             mask_u_w_cutmixed2 = mask_u_w.clone()
             conf_u_w_cutmixed2 = conf_u_w.clone()
-            ignore_mask_cutmixed2 = ignore_mask.clone()
+            mask_u_w_weak_cutmixed2 = mask_u_w_weak.clone()
+            conf_u_w_weak_cutmixed2 = conf_u_w_weak.clone()
+            mask_u_w_strong_cutmixed2 = mask_u_w_strong.clone()
+            conf_u_w_strong_cutmixed2 = conf_u_w_strong.clone()
 
             mask_u_w_cutmixed1[cutmix_box1 == 1] = mask_u_w_mix[cutmix_box1 == 1]
             conf_u_w_cutmixed1[cutmix_box1 == 1] = conf_u_w_mix[cutmix_box1 == 1]
-            ignore_mask_cutmixed1[cutmix_box1 == 1] = ignore_mask_mix[cutmix_box1 == 1]
-
             mask_u_w_cutmixed2[cutmix_box2 == 1] = mask_u_w_mix[cutmix_box2 == 1]
             conf_u_w_cutmixed2[cutmix_box2 == 1] = conf_u_w_mix[cutmix_box2 == 1]
-            ignore_mask_cutmixed2[cutmix_box2 == 1] = ignore_mask_mix[cutmix_box2 == 1]
+            mask_u_w_weak_cutmixed2[cutmix_box2 == 1] = mask_u_w_weak_mix[cutmix_box2 == 1]
+            conf_u_w_weak_cutmixed2[cutmix_box2 == 1] = conf_u_w_weak_mix[cutmix_box2 == 1]
+            mask_u_w_strong_cutmixed2[cutmix_box2 == 1] = mask_u_w_strong_mix[cutmix_box2 == 1]
+            conf_u_w_strong_cutmixed2[cutmix_box2 == 1] = conf_u_w_strong_mix[cutmix_box2 == 1]
 
-            loss_dice = diceloss(pred_x, mask_x)
-            loss_x = (criterion_l(pred_x, mask_x) + loss_dice) / 2.0
+            loss_x = (criterion_ce(pred_x, mask_x) + criterion_dice(pred_x.softmax(dim=1), mask_x.unsqueeze(1).float())) / 2.0
 
-            valid_mask_s1 = (conf_u_w_cutmixed1 >= args.conf_thresh) & (ignore_mask_cutmixed1 != 255)
-            loss_u_s1 = criterion_u(pred_u_s1, mask_u_w_cutmixed1)
-            loss_u_s1 = loss_u_s1 * valid_mask_s1
-            denom_s1 = max((ignore_mask_cutmixed1 != 255).sum().item(), 1)
-            loss_u_s1 = loss_u_s1.sum() / denom_s1
+            loss_u_s1 = criterion_dice(
+                pred_u_s1.softmax(dim=1),
+                mask_u_w_cutmixed1.unsqueeze(1).float(),
+                ignore=(conf_u_w_cutmixed1 < conf_thresh).float(),
+            )
+            loss_u_s2 = criterion_dice(
+                pred_u_s2.softmax(dim=1),
+                mask_u_w_cutmixed2.unsqueeze(1).float(),
+                ignore=(conf_u_w_cutmixed2 < conf_thresh).float(),
+            )
 
-            valid_mask_s2 = (conf_u_w_cutmixed2 >= args.conf_thresh) & (ignore_mask_cutmixed2 != 255)
-            loss_u_s2 = criterion_u(pred_u_s2, mask_u_w_cutmixed2)
-            loss_u_s2 = loss_u_s2 * valid_mask_s2
-            denom_s2 = max((ignore_mask_cutmixed2 != 255).sum().item(), 1)
-            loss_u_s2 = loss_u_s2.sum() / denom_s2
+            loss_weak_dec_w_s2 = criterion_dice(
+                pred_u_s2_weak.softmax(dim=1),
+                mask_u_w_weak_cutmixed2.unsqueeze(1).float(),
+                ignore=(conf_u_w_weak_cutmixed2 < conf_thresh).float(),
+            )
+            loss_strong_dec_w_s2 = criterion_dice(
+                pred_u_s2_strong.softmax(dim=1),
+                mask_u_w_strong_cutmixed2.unsqueeze(1).float(),
+                ignore=(conf_u_w_strong_cutmixed2 < conf_thresh).float(),
+            )
 
-            valid_mask_fp = (conf_u_w >= args.conf_thresh) & (ignore_mask != 255)
-            loss_u_w_fp = criterion_u(pred_u_w_fp, mask_u_w)
-            loss_u_w_fp = loss_u_w_fp * valid_mask_fp
-            denom_fp = max((ignore_mask != 255).sum().item(), 1)
-            loss_u_w_fp = loss_u_w_fp.sum() / denom_fp
+            ignores = (conf_u_w < conf_thresh).float()
+            masks = mask_u_w.unsqueeze(1).float()
+            loss_weak_dec_w_t = criterion_dice(pred_u_w_weak.softmax(dim=1), masks, ignore=ignores)
+            loss_strong_dec_w_t = criterion_dice(pred_u_w_strong.softmax(dim=1), masks, ignore=ignores)
+            loss_weak_dec_w_s2_t = criterion_dice(
+                pred_u_s2_weak.softmax(dim=1),
+                mask_u_w_cutmixed2.unsqueeze(1).float(),
+                ignore=(conf_u_w_cutmixed2 < conf_thresh).float(),
+            )
+            loss_strong_dec_w_s2_t = criterion_dice(
+                pred_u_s2_strong.softmax(dim=1),
+                mask_u_w_cutmixed2.unsqueeze(1).float(),
+                ignore=(conf_u_w_cutmixed2 < conf_thresh).float(),
+            )
 
-            # loss = (loss_x + loss_u_s1 * 0.25 + loss_u_s2 * 0.25 + loss_u_w_fp * 0.5) / 2.0
-            loss = loss_x + loss_u_s1 * 0.05 + loss_u_s2 * 0.05 + loss_u_w_fp * 0.1
-            
+            loss_u_w_kd = (1 - args.eta) * (
+                loss_weak_dec_w_t + loss_strong_dec_w_t + loss_weak_dec_w_s2_t + loss_strong_dec_w_s2_t
+            ) / 4.0 + args.eta * (loss_weak_dec_w_s2 + loss_strong_dec_w_s2) / 2.0
+
+            loss = (loss_x + loss_u_s1 * 0.25 + loss_u_s2 * 0.25 + loss_u_w_kd * 0.5) / 2.0
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -510,49 +620,49 @@ def main(args, cfg, save_path, cp_path):
             total_loss.update(loss.item())
             total_loss_x.update(loss_x.item())
             total_loss_s.update((loss_u_s1.item() + loss_u_s2.item()) / 2.0)
-            total_loss_w_fp.update(loss_u_w_fp.item())
-
-            valid_pixels = max((ignore_mask != 255).sum().item(), 1)
-            mask_ratio = ((conf_u_w >= args.conf_thresh) & (ignore_mask != 255)).sum().item() / valid_pixels
-            total_mask_ratio.update(mask_ratio)
+            total_loss_kd.update(loss_u_w_kd.item())
+            mask_ratio = (conf_u_w >= conf_thresh).sum().float() / max(conf_u_w.numel(), 1)
+            total_mask_ratio.update(mask_ratio.item())
 
             iters = epoch * len(trainloader_u) + i
             lr = cfg['lr'] * (1 - iters / max(total_iters, 1)) ** 0.9
             optimizer.param_groups[0]['lr'] = lr
             iter_num += 1
 
+            if cfg.get('use_threshold_relax', False):
+                thresh_controller.thresh_update(pred_u_w.detach().float())
+                conf_thresh = thresh_controller.get_thresh_global()
+
             writer.add_scalar('train/loss_all', loss.item(), iters)
             writer.add_scalar('train/loss_x', loss_x.item(), iters)
             writer.add_scalar('train/loss_s', (loss_u_s1.item() + loss_u_s2.item()) / 2.0, iters)
-            writer.add_scalar('train/loss_w_fp', loss_u_w_fp.item(), iters)
-            writer.add_scalar('train/mask_ratio', mask_ratio, iters)
+            writer.add_scalar('train/loss_kd', loss_u_w_kd.item(), iters)
+            writer.add_scalar('train/mask_ratio', mask_ratio.item(), iters)
+            writer.add_scalar('train/conf_thresh', float(conf_thresh), iters)
             writer.add_scalar('train/lr', lr, iters)
 
             if i % log_interval == 0:
                 logger.info(
-                    'Iters: {:}, Total loss: {:.3f}, Loss x: {:.3f}, Loss s: {:.3f}, Loss w_fp: {:.3f}, Mask ratio: {:.3f}'.format(
-                        i, total_loss.avg, total_loss_x.avg, total_loss_s.avg, total_loss_w_fp.avg, total_mask_ratio.avg
+                    'Iters: {:}, Total loss: {:.3f}, Loss x: {:.3f}, Loss s: {:.3f}, Loss KD: {:.3f}, Mask ratio: {:.3f}'.format(
+                        i, total_loss.avg, total_loss_x.avg, total_loss_s.avg, total_loss_kd.avg, total_mask_ratio.avg
                     )
                 )
 
+        is_best = False
         if iter_num >= total_iters * args.val_start and epoch % args.val_interval == 0:
             model.eval()
-            mDice, dice_class = eval_2d(valloader, model, cfg, ifdist=False, val_mode='unimatch')
-            mDice = mDice.item()
-
+            mDice, dice_class = eval_2d(valloader, model, cfg, ifdist=False, val_mode='crossmatch')
+            mDice = mDice.item() * 100.0
             for cls_idx, dice in enumerate(dice_class):
                 class_name = class_names[cls_idx] if cls_idx < len(class_names) else str(cls_idx + 1)
-                logger.info('*** Evaluation: Class [{:} {:}] Dice: {:.3f}'.format(cls_idx + 1, class_name, dice.item()))
-                writer.add_scalar(f'eval/{class_name}_DICE', dice.item(), epoch)
-            logger.info('*** Evaluation MeanDice: {:.3f}'.format(mDice))
-            writer.add_scalar('eval/mDice', mDice, epoch)
-
+                writer.add_scalar(f'eval/{class_name}_dice', dice.item() * 100.0, epoch)
+                logger.info('***** Evaluation ***** >>>> Class [{:} {:}] Dice: {:.2f}'.format(cls_idx + 1, class_name, dice.item() * 100.0))
+            writer.add_scalar('eval/MeanDice', mDice, epoch)
+            logger.info('***** Evaluation ***** >>>> MeanDice: {:.2f}\n'.format(mDice))
             is_best = mDice > previous_best
             previous_best = max(mDice, previous_best)
             if is_best:
                 best_epoch = epoch
-        else:
-            is_best = False
 
         checkpoint = {
             'model': model.state_dict(),
@@ -562,14 +672,16 @@ def main(args, cfg, save_path, cp_path):
             'best_epoch': best_epoch,
             'iter_num': iter_num,
             'start_time': start_time,
+            'conf_thresh': float(conf_thresh),
         }
         torch.save(checkpoint, latest_path)
         if is_best:
-            torch.save(checkpoint, os.path.join(cp_path, f'ep{epoch}_m{previous_best:.3f}.pth'))
-            logger.info('*** best checkpoint: MeanDice {:.3f} @epoch {}'.format(previous_best, best_epoch))
+            save_path_best = os.path.join(cp_path, f'ep{epoch}_m{previous_best:.3f}.pth')
+            torch.save(checkpoint, save_path_best)
+            logger.info('save model to {}'.format(save_path_best))
 
     end_time = time.time()
-    logger.info('Training time: {:.2f}s'.format(end_time - start_time))
+    logger.info('Training time: {:.2f}s'.format((end_time - start_time)))
     gc.collect()
     torch.cuda.empty_cache()
     writer.close()
@@ -601,11 +713,13 @@ if __name__ == '__main__':
     torch.cuda.manual_seed_all(seed)
     os.environ['CUDA_VISIBLE_DEVICES'] = args.device.split(':')[-1]
     cfg = yaml.load(open(args.config, 'r'), Loader=yaml.Loader)
+    if args.conf_thresh is not None:
+        cfg['conf_thresh'] = args.conf_thresh
 
     cp_path = os.path.join(
         args.checkpoint_path,
-        'UniMatch/Ep{}bs{}_{}_seed{}_label{}/thresh{}_{}'.format(
-            cfg['epochs'], cfg['batch_size'], cfg['dataset'], args.seed, args.labelnum, args.conf_thresh, args.exp
+        'CrossMatch/Ep{}bs{}_{}_seed{}_label{}/eta{}_{}'.format(
+            cfg['epochs'], cfg['batch_size'], cfg['dataset'], args.seed, args.labelnum, args.eta, args.exp
         ),
     )
     os.makedirs(cp_path, exist_ok=True)
