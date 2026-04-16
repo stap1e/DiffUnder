@@ -1,46 +1,52 @@
 import os
+
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True,max_split_size_mb:128')
-import yaml
-import time
-import shutil
-import random
-import logging
-import pprint
-from copy import deepcopy
-import torch
-import sys
+
 import argparse
 import gc
+import logging
+import pprint
+import random
+import shutil
+import sys
+import time
+from copy import deepcopy
+
 import numpy as np
-from torch.optim import AdamW
+import torch
 import torch.backends.cudnn as cudnn
-from torch import nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, ConcatDataset
+import yaml
+from torch import nn
+from torch.optim import AdamW
+from torch.utils.data import ConcatDataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+project_root = os.path.abspath(os.path.dirname(__file__))
 sys.path.append(project_root)
-from Datasets.efficient import BUSISemiDataset, TwoStreamBatchSampler, mix_collate_fn
+
+from Datasets.efficient import ACDCsemiDataset, TwoStreamBatchSampler, mix_collate_fn
 from models.unet2d import UNet
 from utils.classes import CLASSES
 from utils.datasets import DATASET_CONFIGS
-from utils.util import count_params, init_log, AverageMeter, DiceLoss
+from utils.util import AverageMeter, DiceLoss, count_params, init_log
 from utils.val import eval_2d
 
 
-DEFAULT_BUSI_CFG = {
-    'dataset': 'BUSI',
-    'base_dir': '/data/lhy_data/BUSI',
-    'labelnum': 100,
-    'label_help': 'number of labeled BUSI images',
-    'num': None,
-    'nclass': 2,
-    'lr': 0.001,
+DEFAULT_ACDC_CFG = {
+    'dataset': 'ACDC',
+    'base_dir': '/data/lhy_data/ACDC',
+    'labelnum': 14,
+    'label_help': '14 for 1:5; 7 for 1:10; 3 for 1:20',
+    'num': 56,
+    'nclass': 4,
+    'lr': 0.01,
     'epochs': 200,
     'batch_size': 8,
-    'crop_size': 256,
+    'crop_size': [256, 256],
+    'val_patch_size': [256, 256],
+    'num_workers': 6,
     'conf_thresh': 0.95,
     'sup_weight': 1.0,
     'consistency_weight': 0.5,
@@ -48,9 +54,6 @@ DEFAULT_BUSI_CFG = {
     'mask_ratio': 0.2,
     'mask_block_size': 32,
     'feature_dim': 64,
-    'transformer_dim': 128,
-    'transformer_depth': 4,
-    'transformer_heads': 4,
     'sinkhorn_eps': 0.05,
     'sinkhorn_iters': 30,
     'sinkhorn_max_tokens': 256,
@@ -87,17 +90,22 @@ def update_ema_variables(model, ema_model, alpha, global_step):
 def get_default_args(cli_dataset):
     if cli_dataset in DATASET_CONFIGS:
         defaults = dict(DATASET_CONFIGS[cli_dataset])
-        defaults.setdefault('dataset', cli_dataset)
+        defaults.setdefault('dataset', 'ACDC')
         return defaults
-    return dict(DEFAULT_BUSI_CFG)
+    return dict(DEFAULT_ACDC_CFG)
 
 
 def get_parser(defaults):
-    parser = argparse.ArgumentParser(description=defaults.get('dataset', 'BUSI'))
-    parser.add_argument('--dataset', type=str, default=defaults.get('dataset', 'BUSI'))
-    parser.add_argument('--base_dir', type=str, default=defaults.get('base_dir', DEFAULT_BUSI_CFG['base_dir']))
-    parser.add_argument('--labelnum', type=int, default=defaults.get('labelnum', DEFAULT_BUSI_CFG['labelnum']), help=defaults.get('label_help', DEFAULT_BUSI_CFG['label_help']))
-    parser.add_argument('--num', default=defaults.get('num', DEFAULT_BUSI_CFG['num']), type=int, help='unlabeled data number')
+    parser = argparse.ArgumentParser(description=defaults.get('dataset', 'ACDC'))
+    parser.add_argument('--dataset', type=str, default=defaults.get('dataset', 'ACDC'))
+    parser.add_argument('--base_dir', type=str, default=defaults.get('base_dir', DEFAULT_ACDC_CFG['base_dir']))
+    parser.add_argument(
+        '--labelnum',
+        type=int,
+        default=defaults.get('labelnum', DEFAULT_ACDC_CFG['labelnum']),
+        help=defaults.get('label_help', DEFAULT_ACDC_CFG['label_help']),
+    )
+    parser.add_argument('--num', default=defaults.get('num', DEFAULT_ACDC_CFG['num']), type=int, help='unlabeled data number')
     parser.add_argument('--config', type=str, default=defaults.get('config'))
     parser.add_argument('--seed', type=int, default=2026)
     parser.add_argument('--device', type=str, default='cuda:0')
@@ -109,14 +117,14 @@ def get_parser(defaults):
 
 
 def load_cfg(args, defaults):
-    cfg = dict(DEFAULT_BUSI_CFG)
+    cfg = dict(DEFAULT_ACDC_CFG)
     cfg.update(defaults)
     if args.config is not None:
         with open(args.config, 'r') as f:
             cfg.update(yaml.load(f, Loader=yaml.Loader))
-    cfg['dataset'] = args.dataset
-    cfg.setdefault('consistency_weight', cfg.get('ot_weight', DEFAULT_BUSI_CFG['consistency_weight']))
-    cfg.setdefault('consistency_mode', DEFAULT_BUSI_CFG['consistency_mode'])
+    cfg['dataset'] = cfg.get('dataset', 'ACDC')
+    cfg.setdefault('consistency_weight', cfg.get('ot_weight', DEFAULT_ACDC_CFG['consistency_weight']))
+    cfg.setdefault('consistency_mode', DEFAULT_ACDC_CFG['consistency_mode'])
     return cfg
 
 
@@ -141,7 +149,6 @@ def generate_2d_mask(feature, mask_ratio=0.2, min_block_size=16, max_block_size=
     b, _, h, w = feature.shape
     device = feature.device
     context_mask = torch.ones((b, 1, h, w), device=device, dtype=feature.dtype)
-    target_mask = torch.zeros_like(context_mask)
     total_pixels = h * w
     mask_ratio = float(np.clip(mask_ratio, 0.0, 0.35))
     target_pixels = max(1, int(total_pixels * mask_ratio))
@@ -200,147 +207,6 @@ class UNetFeatureBranch(nn.Module):
         if return_feature:
             return logits, feature
         return logits
-
-
-class TransformerSegBranch(nn.Module):
-    def __init__(self, in_chns, class_num, feature_dim, embed_dim=128, depth=4, num_heads=4):
-        super().__init__()
-        self.patch_embed = nn.Sequential(
-            nn.Conv2d(in_chns, embed_dim // 2, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(embed_dim // 2),
-            nn.GELU(),
-            nn.Conv2d(embed_dim // 2, embed_dim, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(embed_dim),
-            nn.GELU(),
-        )
-        self.pos_conv = nn.Conv2d(embed_dim, embed_dim, kernel_size=3, stride=1, padding=1, groups=embed_dim, bias=False)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
-            nhead=num_heads,
-            dim_feedforward=embed_dim * 4,
-            dropout=0.1,
-            activation='gelu',
-            batch_first=True,
-            norm_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(embed_dim, embed_dim // 2, kernel_size=2, stride=2, bias=False),
-            nn.BatchNorm2d(embed_dim // 2),
-            nn.GELU(),
-            nn.ConvTranspose2d(embed_dim // 2, feature_dim, kernel_size=2, stride=2, bias=False),
-            nn.BatchNorm2d(feature_dim),
-            nn.GELU(),
-        )
-        self.classifier = nn.Conv2d(feature_dim, class_num, kernel_size=1)
-        self.feature_proj = nn.Sequential(
-            nn.Conv2d(feature_dim, feature_dim, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(feature_dim),
-            nn.GELU(),
-        )
-
-    def forward(self, x, return_feature=False):
-        feature = self.patch_embed(x)
-        feature = feature + self.pos_conv(feature)
-        b, c, h, w = feature.shape
-        tokens = feature.flatten(2).transpose(1, 2)
-        tokens = self.transformer(tokens)
-        feature = tokens.transpose(1, 2).reshape(b, c, h, w)
-        feature = self.decoder(feature)
-        logits = self.classifier(feature)
-        latent_feature = self.feature_proj(feature)
-        if return_feature:
-            return logits, latent_feature
-        return logits
-
-
-class DecoupledPredictor(nn.Module):
-    def __init__(self, in_channels, hidden_channels=None, out_channels=None):
-        super().__init__()
-        hidden_channels = hidden_channels or max(in_channels, 64)
-        out_channels = out_channels or in_channels
-        self.semantic_head = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(in_channels, hidden_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(hidden_channels),
-            nn.GELU(),
-            nn.Conv2d(hidden_channels, out_channels, kernel_size=1),
-        )
-        self.structural_head = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1, groups=in_channels, bias=False),
-            nn.BatchNorm2d(in_channels),
-            nn.GELU(),
-            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.GELU(),
-        )
-        self.fuse = nn.Sequential(
-            nn.Conv2d(out_channels * 2, out_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.GELU(),
-        )
-        self.residual = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
-
-    def forward(self, x):
-        semantic = self.semantic_head(x).expand(-1, -1, x.shape[-2], x.shape[-1])
-        high_freq = x - F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
-        structural = self.structural_head(high_freq)
-        return self.fuse(torch.cat([semantic, structural], dim=1)) + self.residual(x)
-
-
-class SinkhornOTLoss(nn.Module):
-    def __init__(self, epsilon=0.05, max_iter=30, max_tokens=256):
-        super().__init__()
-        self.epsilon = epsilon
-        self.max_iter = max_iter
-        self.max_tokens = max_tokens
-
-    def _sample_tokens(self, tokens):
-        if tokens.shape[0] <= self.max_tokens:
-            return tokens
-        indices = torch.linspace(0, tokens.shape[0] - 1, steps=self.max_tokens, device=tokens.device).long()
-        return tokens.index_select(0, indices)
-
-    def _flatten_tokens(self, feature_map, mask=None):
-        tokens = feature_map.permute(1, 2, 0).reshape(-1, feature_map.shape[0])
-        if mask is not None:
-            valid = mask.reshape(-1) > 0.5
-            if valid.sum() > 1:
-                tokens = tokens[valid]
-        return self._sample_tokens(tokens)
-
-    def _sinkhorn_distance(self, pred_tokens, target_tokens):
-        pred_tokens = F.normalize(pred_tokens, dim=-1)
-        target_tokens = F.normalize(target_tokens, dim=-1)
-        cost = 1.0 - pred_tokens @ target_tokens.transpose(0, 1)
-        log_kernel = -cost / self.epsilon
-        log_mu = pred_tokens.new_full((pred_tokens.shape[0],), -np.log(pred_tokens.shape[0]))
-        log_nu = target_tokens.new_full((target_tokens.shape[0],), -np.log(target_tokens.shape[0]))
-        u = torch.zeros_like(log_mu)
-        v = torch.zeros_like(log_nu)
-
-        for _ in range(self.max_iter):
-            u = log_mu - torch.logsumexp(log_kernel + v.unsqueeze(0), dim=1)
-            v = log_nu - torch.logsumexp(log_kernel + u.unsqueeze(1), dim=0)
-
-        transport = torch.exp(log_kernel + u.unsqueeze(1) + v.unsqueeze(0))
-        return torch.sum(transport * cost)
-
-    def forward(self, pred_feature, target_feature, target_mask=None):
-        batch_losses = []
-        for batch_idx in range(pred_feature.shape[0]):
-            mask = None
-            if target_mask is not None:
-                mask = target_mask[batch_idx, 0] if target_mask.ndim == 4 else target_mask[batch_idx]
-            pred_tokens = self._flatten_tokens(pred_feature[batch_idx], mask)
-            target_tokens = self._flatten_tokens(target_feature[batch_idx], mask)
-            if pred_tokens.shape[0] == 0 or target_tokens.shape[0] == 0:
-                continue
-            batch_losses.append(self._sinkhorn_distance(pred_tokens, target_tokens))
-
-        if not batch_losses:
-            return pred_feature.new_tensor(0.0)
-        return torch.stack(batch_losses).mean()
 
 
 def compute_supervised_loss(logits, target, criterion_ce, criterion_dice):
@@ -459,7 +325,7 @@ def main(args, cfg, save_path, cp_path):
     writer = SummaryWriter(save_path)
 
     student_model = init_2d_weight(
-        UNetFeatureBranch(in_chns=3, class_num=cfg['nclass'], feature_dim=cfg['feature_dim']).cuda()
+        UNetFeatureBranch(in_chns=1, class_num=cfg['nclass'], feature_dim=cfg['feature_dim']).cuda()
     ).cuda()
     teacher_model = deepcopy(student_model).cuda()
     set_requires_grad(teacher_model, False)
@@ -478,9 +344,9 @@ def main(args, cfg, save_path, cp_path):
     logger.info('Student params: {:.3f}M'.format(count_params(student_model)))
     logger.info('Teacher params: {:.3f}M'.format(count_params(teacher_model)))
 
-    trainset_u = BUSISemiDataset('train_u', args, cfg['crop_size'])
-    trainset_l = BUSISemiDataset('train_l', args, cfg['crop_size'])
-    valset = BUSISemiDataset('val', args, cfg['crop_size'])
+    trainset_u = ACDCsemiDataset('train_u', args, cfg['crop_size'])
+    trainset_l = ACDCsemiDataset('train_l', args, cfg['crop_size'])
+    valset = ACDCsemiDataset('val', args, cfg['crop_size'])
     valloader = DataLoader(valset, batch_size=1, pin_memory=True, num_workers=1, drop_last=False)
 
     labeled_bs = cfg['batch_size']
@@ -498,7 +364,7 @@ def main(args, cfg, save_path, cp_path):
     trainloader = DataLoader(
         train_dataset,
         batch_sampler=batch_sampler,
-        num_workers=6,
+        num_workers=cfg.get('num_workers', DEFAULT_ACDC_CFG['num_workers']),
         pin_memory=True,
         collate_fn=mix_collate_fn,
     )
@@ -531,8 +397,8 @@ def main(args, cfg, save_path, cp_path):
                 start_time = checkpoint['start_time']
                 logger.info('************ Load EMA checkpoint at epoch %i\n' % epoch)
             else:
-                student_model.load_state_dict(checkpoint['model_a'], strict=False)
-                teacher_model.load_state_dict(checkpoint.get('teacher_model', checkpoint['model_a']), strict=False)
+                student_model.load_state_dict(checkpoint['model'], strict=False)
+                teacher_model.load_state_dict(checkpoint.get('model_ema', checkpoint['model']), strict=False)
                 start_time = time.time()
                 logger.info('************ Load legacy student weights and reset optimizer state\n')
         except Exception as exc:
@@ -606,9 +472,11 @@ def main(args, cfg, save_path, cp_path):
 
             for cls_idx, dice in enumerate(dice_class_student):
                 class_name = class_names[cls_idx] if cls_idx < len(class_names) else str(cls_idx + 1)
-                logger.info('*** Evaluation: Class [{:} {:}] Dice Student: {:.3f}, Teacher: {:.3f}'.format(
-                    cls_idx + 1, class_name, dice, dice_class_teacher[cls_idx]
-                ))
+                logger.info(
+                    '*** Evaluation: Class [{:} {:}] Dice Student: {:.3f}, Teacher: {:.3f}'.format(
+                        cls_idx + 1, class_name, dice, dice_class_teacher[cls_idx]
+                    )
+                )
                 writer.add_scalar(f'eval/{class_name}_student_DICE', dice, epoch)
                 writer.add_scalar(f'eval/{class_name}_teacher_DICE', dice_class_teacher[cls_idx], epoch)
 
@@ -647,7 +515,10 @@ def main(args, cfg, save_path, cp_path):
                     best_dice_student, best_dice_teacher, args.exp
                 )
             )
-            torch.save(model_ckpt, os.path.join(cp_path, f'ep{epoch}_student_{best_dice_student:.3f}_teacher_{best_dice_teacher:.3f}.pth'))
+            torch.save(
+                model_ckpt,
+                os.path.join(cp_path, f'ep{epoch}_student_{best_dice_student:.3f}_teacher_{best_dice_teacher:.3f}.pth'),
+            )
 
         if epoch >= cfg['epochs'] - 1:
             end_time = time.time()
@@ -659,7 +530,7 @@ def main(args, cfg, save_path, cp_path):
 
 if __name__ == '__main__':
     data_parser = argparse.ArgumentParser(description='datasets')
-    data_parser.add_argument('--cli_dataset', type=str, default='BUSI')
+    data_parser.add_argument('--cli_dataset', type=str, default='20acdc')
     known_args, remaining_args = data_parser.parse_known_args()
     defaults = get_default_args(known_args.cli_dataset)
     parser = get_parser(defaults)
