@@ -26,12 +26,27 @@ from torch.utils.tensorboard import SummaryWriter
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(project_root)
-from Datasets.efficient import ACDCsemiDataset, TwoStreamBatchSampler, mix_collate_fn
+from Datasets.efficient import BUSISemiDataset, TwoStreamBatchSampler, mix_collate_fn
 from models.unet2d import UNet
 from utils.classes import CLASSES
 from utils.datasets import DATASET_CONFIGS
 from utils.util import AverageMeter, DiceLoss, count_params, init_log
 from utils.val import eval_2d
+
+
+DEFAULT_BUSI_CFG = {
+    'dataset': 'BUSI',
+    'base_dir': '/data/lhy_data/BUSI/Dataset_BUSI_with_GT/without_normal',
+    'labelnum': 64,
+    'label_help': '64 for 1:8; 32 for 1:16; 16 for 1:32',
+    'num': None,
+    'nclass': 2,
+    'lr': 0.01,
+    'epochs': 200,
+    'batch_size': 8,
+    'crop_size': [256, 256],
+    'val_patch_size': [256, 256],
+}
 
 
 def str2bool(value):
@@ -45,17 +60,24 @@ def str2bool(value):
     raise argparse.ArgumentTypeError(f'Invalid boolean value: {value}')
 
 
-def get_parser(datasetname):
-    cfgs = DATASET_CONFIGS[datasetname]
-    parser = argparse.ArgumentParser(description=datasetname)
-    parser.add_argument('--dataset', type=str, default=datasetname, choices=DATASET_CONFIGS.keys())
-    parser.add_argument('--base_dir', type=str, default=cfgs['base_dir'])
-    parser.add_argument('--labelnum', type=int, default=cfgs['labelnum'], help=cfgs['label_help'])
-    parser.add_argument('--num', default=cfgs['num'], type=int, help='unlabeled data number')
-    parser.add_argument('--config', type=str, default=cfgs['config'])
+def get_default_args(cli_dataset):
+    if cli_dataset in DATASET_CONFIGS:
+        defaults = dict(DATASET_CONFIGS[cli_dataset])
+        defaults.setdefault('dataset', cli_dataset)
+        return defaults
+    return dict(DEFAULT_BUSI_CFG)
+
+
+def get_parser(defaults):
+    parser = argparse.ArgumentParser(description=defaults.get('dataset', 'BUSI'))
+    parser.add_argument('--dataset', type=str, default=defaults.get('dataset', 'BUSI'))
+    parser.add_argument('--base_dir', type=str, default=defaults.get('base_dir', DEFAULT_BUSI_CFG['base_dir']))
+    parser.add_argument('--labelnum', type=int, default=defaults.get('labelnum', DEFAULT_BUSI_CFG['labelnum']), help=defaults.get('label_help', DEFAULT_BUSI_CFG['label_help']))
+    parser.add_argument('--num', default=defaults.get('num', DEFAULT_BUSI_CFG['num']), type=int, help='unlabeled data number')
+    parser.add_argument('--config', type=str, default=defaults.get('config'))
     parser.add_argument('--seed', type=int, default=2026)
-    parser.add_argument('--device', type=str, default='cuda:7')
-    parser.add_argument('--exp', type=str, help='Experiment description')
+    parser.add_argument('--device', type=str, default='cuda:0')
+    parser.add_argument('--exp', type=str, required=True, help='Experiment description')
     parser.add_argument('--checkpoint_path', type=str, default='/data/lhy_data/checkpoints_wyy')
     parser.add_argument('--deterministic', type=str2bool, default=False)
     parser.add_argument('--ema_decay', type=float, default=0.99)
@@ -84,6 +106,25 @@ def get_parser(datasetname):
     parser.add_argument('--prototype_threshold', type=float, default=0.8)
     parser.add_argument('--prototype_temperature', type=float, default=0.5)
     return parser
+
+
+def load_cfg(args, defaults):
+    cfg = dict(DEFAULT_BUSI_CFG)
+    cfg.update(defaults)
+    if args.config is not None:
+        with open(args.config, 'r') as f:
+            cfg.update(yaml.load(f, Loader=yaml.Loader))
+    cfg['dataset'] = args.dataset
+    return cfg
+
+
+def build_class_names(cfg):
+    class_names = CLASSES.get(cfg.get('dataset')) or CLASSES.get(str(cfg.get('dataset')).upper())
+    if class_names is None:
+        return [str(i) for i in range(1, cfg['nclass'])]
+    if len(class_names) == cfg['nclass']:
+        return class_names[1:]
+    return class_names[:cfg['nclass'] - 1]
 
 
 class FeatureExtractor(nn.Module):
@@ -316,12 +357,7 @@ def sinkhorn_align_distribution(prob_map, valid_mask, target_prior, eps=0.5, num
 
     prob_valid = flat_prob[flat_valid].detach()
     kernel = torch.exp(torch.log(prob_valid.clamp_min(1e-6)) / max(eps, 1e-3)).clamp_min(1e-8)
-    row_prior = torch.full(
-        (kernel.shape[0],),
-        1.0 / max(kernel.shape[0], 1),
-        device=kernel.device,
-        dtype=kernel.dtype,
-    )
+    row_prior = torch.full((kernel.shape[0],), 1.0 / max(kernel.shape[0], 1), device=kernel.device, dtype=kernel.dtype)
     col_prior = normalize_distribution(target_prior.to(kernel.device, kernel.dtype))
     transport = kernel
     for _ in range(num_iters):
@@ -400,12 +436,7 @@ def compute_prototype_contrastive_loss(
         sample_idx = sample_fn(cls_features.shape[0], sample_count).to(cls_features.device)
         anchor_features = cls_features[sample_idx]
         logits = torch.matmul(anchor_features, proto_bank.t()) / temp
-        targets = torch.full(
-            (sample_count,),
-            class_to_bank_idx[cls_idx],
-            dtype=torch.long,
-            device=anchor_features.device,
-        )
+        targets = torch.full((sample_count,), class_to_bank_idx[cls_idx], dtype=torch.long, device=anchor_features.device)
         losses.append(F.cross_entropy(logits, targets))
 
     if not losses:
@@ -518,95 +549,6 @@ def compute_unsupervised_loss(predict, target, logits, strong_threshold, ignore_
     return (weighting[:, None, None] * loss * valid_mask).sum() / valid_mask.sum().clamp_min(1.0)
 
 
-def compute_contra_memobank_loss(
-    rep,
-    label_l,
-    label_u,
-    prob_l,
-    prob_u,
-    low_mask,
-    high_mask,
-    memobank,
-    queue_ptrlis,
-    queue_size,
-    rep_teacher,
-    delta_n=1.0,
-    func='smc',
-    num_queries=256,
-    num_negatives=512,
-    temp=0.5,
-):
-    num_feat = rep.shape[1]
-    num_segments = label_l.shape[1]
-    low_rank = min(3, num_segments)
-    high_rank = max(low_rank + 1, min(20, num_segments))
-    sample_fn = {'asmc': grid_as_monte_carlo_sample, 'smc': grid_monte_carlo_sample}.get(func, monte_carlo_sample)
-
-    low_valid_pixel = torch.cat((label_l, label_u), dim=0) * low_mask
-    high_valid_pixel = torch.cat((label_l, label_u), dim=0) * high_mask
-
-    rep = rep.permute(0, 2, 3, 1)
-    rep_teacher = rep_teacher.permute(0, 2, 3, 1)
-
-    _, prob_indices_l = torch.sort(prob_l, 1, descending=True)
-    prob_indices_l = prob_indices_l.permute(0, 2, 3, 1)
-    _, prob_indices_u = torch.sort(prob_u, 1, descending=True)
-    prob_indices_u = prob_indices_u.permute(0, 2, 3, 1)
-    prob = torch.cat((prob_l, prob_u), dim=0)
-
-    class_entries = []
-    for cls_idx in range(num_segments):
-        low_valid_pixel_seg = low_valid_pixel[:, cls_idx].bool()
-        high_valid_pixel_seg = high_valid_pixel[:, cls_idx].bool()
-        prob_seg = prob[:, cls_idx]
-
-        rep_mask_low_entropy = (prob_seg > 0.3) & low_valid_pixel_seg
-        rep_mask_high_entropy = (prob_seg < delta_n) & high_valid_pixel_seg
-        seg_feat_low_entropy = rep[rep_mask_low_entropy]
-
-        if high_rank > low_rank:
-            class_mask_u = prob_indices_u[:, :, :, low_rank:high_rank].eq(cls_idx).any(dim=3)
-        else:
-            class_mask_u = prob_indices_u[:, :, :, -1:].eq(cls_idx).any(dim=3)
-        class_mask_l = prob_indices_l[:, :, :, :max(low_rank, 1)].eq(cls_idx).any(dim=3)
-        class_mask = torch.cat((class_mask_l & (label_l[:, cls_idx] == 0), class_mask_u), dim=0)
-        negative_mask = rep_mask_high_entropy & class_mask
-        enqueue_memobank(rep_teacher[negative_mask], memobank[cls_idx], queue_ptrlis[cls_idx], queue_size[cls_idx])
-
-        if low_valid_pixel_seg.any():
-            seg_proto = rep_teacher[low_valid_pixel_seg].detach().mean(dim=0, keepdim=True)
-            class_entries.append((cls_idx, seg_proto, seg_feat_low_entropy))
-
-    if len(class_entries) <= 1:
-        return rep.sum() * 0.0
-
-    reco_loss = rep.new_tensor(0.0)
-    valid_count = 0
-    for cls_idx, seg_proto, seg_feat_low_entropy in class_entries:
-        bank = memobank[cls_idx][0]
-        if seg_feat_low_entropy.shape[0] == 0 or bank.shape[0] == 0:
-            continue
-
-        anchor_idx = sample_fn(seg_feat_low_entropy.shape[0], num_queries).to(seg_feat_low_entropy.device)
-        anchor_feat = seg_feat_low_entropy[anchor_idx]
-
-        negative_idx = sample_fn(bank.shape[0], num_queries * num_negatives)
-        negative_feat = bank[negative_idx].to(anchor_feat.device).reshape(num_queries, num_negatives, num_feat)
-        positive_feat = seg_proto.unsqueeze(0).repeat(num_queries, 1, 1).to(anchor_feat.device)
-        all_feat = torch.cat((positive_feat, negative_feat), dim=1)
-
-        seg_logits = F.cosine_similarity(anchor_feat.unsqueeze(1), all_feat, dim=2)
-        reco_loss = reco_loss + F.cross_entropy(
-            seg_logits / temp,
-            torch.zeros(num_queries, dtype=torch.long, device=anchor_feat.device),
-        )
-        valid_count += 1
-
-    if valid_count == 0:
-        return rep.sum() * 0.0
-    return reco_loss / valid_count
-
-
 def main(args, cfg, save_path, cp_path):
     logger = init_log('global', logging.INFO, os.path.join(save_path, args.exp))
     logger.propagate = 0
@@ -614,7 +556,7 @@ def main(args, cfg, save_path, cp_path):
     logger.info('{}\n'.format(pprint.pformat(all_args)))
     writer = SummaryWriter(save_path)
 
-    model = UNet(in_chns=1, class_num=cfg['nclass']).cuda()
+    model = UNet(in_chns=3, class_num=cfg['nclass']).cuda()
     ema_model = deepcopy(model).cuda()
     for param in ema_model.parameters():
         param.detach_()
@@ -629,12 +571,6 @@ def main(args, cfg, save_path, cp_path):
 
     params = list(model.parameters()) + list(q_feature_extractor.parameters()) + list(q_representation.parameters())
     optimizer = SGD(params=params, lr=cfg['lr'], weight_decay=1e-4, momentum=0.9, nesterov=True)
-    # optimizer = AdamW(
-    #     params=model.parameters(),
-    #     lr=cfg['lr'],
-    #     betas=(0.9, 0.999),
-    #     weight_decay=0.01,
-    # )
 
     criterion_l = nn.CrossEntropyLoss(ignore_index=255).cuda()
     diceloss = DiceLoss(cfg['nclass']).cuda()
@@ -643,9 +579,9 @@ def main(args, cfg, save_path, cp_path):
     logger.info('use {} gpus!'.format(num_gpus))
     logger.info('Total params: {:.3f}M'.format(count_params(model)))
 
-    trainset_u = ACDCsemiDataset('train_u', args, cfg['crop_size'])
-    trainset_l = ACDCsemiDataset('train_l', args, cfg['crop_size'])
-    valset = ACDCsemiDataset('val', args, cfg['crop_size'])
+    trainset_u = BUSISemiDataset('train_u', args, cfg['crop_size'])
+    trainset_l = BUSISemiDataset('train_l', args, cfg['crop_size'])
+    valset = BUSISemiDataset('val', args, cfg['crop_size'])
     valloader = DataLoader(valset, batch_size=1, pin_memory=True, num_workers=1, drop_last=False)
 
     labeled_bs = cfg['batch_size']
@@ -672,6 +608,7 @@ def main(args, cfg, save_path, cp_path):
     total_iters = len(trainloader) * cfg['epochs']
     logger.info('Total iters: %d', total_iters)
     log_interval = max(len(trainloader) // 8, 1)
+    class_names = build_class_names(cfg)
 
     random_pool = F.normalize(torch.randn(args.K, feature_dim_sum, device='cuda'), dim=1)
     random_pool_ptr = torch.zeros(1, dtype=torch.long, device='cuda')
@@ -895,7 +832,7 @@ def main(args, cfg, save_path, cp_path):
             mDice = torch.as_tensor(mDice)
             mDice_ema = torch.as_tensor(mDice_ema)
             for cls_idx, dice in enumerate(dice_class):
-                class_name = CLASSES[cfg['dataset']][cls_idx]
+                class_name = class_names[cls_idx] if cls_idx < len(class_names) else str(cls_idx + 1)
                 logger.info(
                     '*** Evaluation: Class [{:} {:}] Dice model: {:.3f}, ema: {:.3f}'.format(
                         cls_idx + 1,
@@ -967,15 +904,10 @@ def main(args, cfg, save_path, cp_path):
 
 if __name__ == '__main__':
     data_parser = argparse.ArgumentParser(description='datasets')
-    data_parser.add_argument('--cli_dataset', type=str)
+    data_parser.add_argument('--cli_dataset', type=str, default='BUSI')
     known_args, remaining_args = data_parser.parse_known_args()
-    dataset_name = known_args.cli_dataset
-    print(dataset_name)
-    if dataset_name not in DATASET_CONFIGS:
-        print(f'Error: {dataset_name} not found in configs.')
-        sys.exit(1)
-
-    parser = get_parser(dataset_name)
+    defaults = get_default_args(known_args.cli_dataset)
+    parser = get_parser(defaults)
     args = parser.parse_args(remaining_args)
 
     if not args.deterministic:
@@ -992,12 +924,11 @@ if __name__ == '__main__':
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     os.environ['CUDA_VISIBLE_DEVICES'] = args.device.split(':')[-1]
-    with open(args.config, 'r') as f:
-        cfg = yaml.load(f, Loader=yaml.Loader)
+    cfg = load_cfg(args, defaults)
 
     cp_path = os.path.join(
         args.checkpoint_path,
-        'OT_ARCO/Ep{}bs{}_{}_seed{}_label{}/{}'.format(
+        'OT_ARCO_BUSI/Ep{}bs{}_{}_seed{}_label{}/{}'.format(
             cfg['epochs'],
             cfg['batch_size'],
             cfg['dataset'],
@@ -1010,7 +941,7 @@ if __name__ == '__main__':
     save_path = os.path.join(cp_path, 'log')
     os.makedirs(save_path, exist_ok=True)
 
-    include_list = ['comparsion', 'utils', 'configs', 'Datasets', 'models', 'scripts', 'tools']
+    include_list = ['Datasets', 'models', 'utils', 'configs', 'c_busi', 'tools']
     target_dir = os.path.join(cp_path, 'code')
     if os.path.exists(target_dir):
         shutil.rmtree(target_dir)
